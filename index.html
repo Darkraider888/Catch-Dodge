@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Catch & Dodge (Offline)</title>
+  <style>
+    :root { color-scheme: dark; }
+    body{
+      margin:0; height:100vh; display:grid; place-items:center;
+      background: radial-gradient(1200px 800px at 50% 20%, #1a2540, #070a12 70%);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      user-select:none;
+      overflow:hidden;
+    }
+    .wrap{
+      display:grid;
+      gap:10px;
+      justify-items:center;
+      width:min(540px, 96vw);
+    }
+    canvas{
+      width:100%;
+      aspect-ratio: 3 / 4;
+      background: linear-gradient(#070a12, #05060a);
+      border: 1px solid rgba(255,255,255,.15);
+      border-radius: 14px;
+      box-shadow: 0 18px 70px rgba(0,0,0,.55);
+      touch-action: none;
+    }
+    .bar{
+      width:100%;
+      display:flex;
+      gap:8px;
+      justify-content:space-between;
+      align-items:center;
+      color:rgba(255,255,255,.85);
+      font-size:14px;
+    }
+    .hint{
+      opacity:.75;
+      font-size:12px;
+      text-align:center;
+      line-height:1.35;
+    }
+    .buttons{
+      width:100%;
+      display:flex;
+      gap:10px;
+      justify-content:center;
+      align-items:center;
+    }
+    button{
+      appearance:none;
+      border:1px solid rgba(255,255,255,.18);
+      background: rgba(255,255,255,.06);
+      color:rgba(255,255,255,.9);
+      padding:12px 16px;
+      border-radius:12px;
+      font-weight:600;
+      letter-spacing:.2px;
+      cursor:pointer;
+      min-width:92px;
+      transition: transform .05s ease;
+    }
+    button:active{ transform: translateY(1px) scale(.99); }
+    .small{ min-width: 76px; padding:12px 14px; }
+    .kbd{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: rgba(255,255,255,.07);
+      border: 1px solid rgba(255,255,255,.12);
+      padding: 1px 6px;
+      border-radius: 7px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="bar">
+      <div id="uiLeft">Score: 0 • Lives: 3</div>
+      <div id="uiRight">High: 0</div>
+    </div>
+
+    <canvas id="game" width="480" height="640" aria-label="Catch and Dodge game"></canvas>
+
+    <div class="buttons">
+      <button id="btnLeft" class="small">◀</button>
+      <button id="btnPause">Pause</button>
+      <button id="btnRight" class="small">▶</button>
+    </div>
+
+    <div class="hint">
+      Catch <b>coins</b> (+10), avoid <b>bombs</b> (lose life).<br/>
+      Keyboard: <span class="kbd">←</span>/<span class="kbd">→</span> or <span class="kbd">A</span>/<span class="kbd">D</span>, pause: <span class="kbd">P</span>.
+    </div>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d', { alpha: false });
+
+  const uiLeft  = document.getElementById('uiLeft');
+  const uiRight = document.getElementById('uiRight');
+
+  const btnLeft  = document.getElementById('btnLeft');
+  const btnRight = document.getElementById('btnRight');
+  const btnPause = document.getElementById('btnPause');
+
+  // ---------- Simple sound (offline, no files) ----------
+  let audioCtx = null;
+  function beep(freq = 440, dur = 0.06, vol = 0.05) {
+    try {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const t0 = audioCtx.currentTime;
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.type = 'sine';
+      o.frequency.value = freq;
+      g.gain.value = vol;
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(t0);
+      o.stop(t0 + dur);
+    } catch { /* ignore */ }
+  }
+
+  // ---------- Helpers ----------
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const rand  = (a, b) => a + Math.random() * (b - a);
+
+  function rectCircleCollide(rx, ry, rw, rh, cx, cy, cr) {
+    const px = clamp(cx, rx, rx + rw);
+    const py = clamp(cy, ry, ry + rh);
+    const dx = cx - px, dy = cy - py;
+    return (dx*dx + dy*dy) <= cr*cr;
+  }
+
+  // ---------- Starfield background ----------
+  const stars = Array.from({ length: 90 }, () => ({
+    x: Math.random() * canvas.width,
+    y: Math.random() * canvas.height,
+    r: rand(0.6, 1.6),
+    s: rand(10, 40) // speed
+  }));
+
+  // ---------- Game state ----------
+  const STORAGE_KEY = 'catch_dodge_highscore_v1';
+  let highScore = Number(localStorage.getItem(STORAGE_KEY) || 0);
+
+  let state = 'menu'; // menu | playing | paused | gameover
+  let score = 0;
+  let lives = 3;
+
+  const player = {
+    w: 62, h: 16,
+    x: canvas.width / 2 - 31,
+    y: canvas.height - 46,
+    speed: 340
+  };
+
+  const drops = []; // falling objects
+
+  let elapsed = 0;
+  let spawnAcc = 0;
+  let lastT = performance.now();
+  let shake = 0;
+
+  // ---------- Input ----------
+  const keys = { left:false, right:false };
+
+  function setKey(side, val){ keys[side] = val; }
+
+  window.addEventListener('keydown', (e) => {
+    const k = e.key.toLowerCase();
+    if (k === 'arrowleft' || k === 'a') setKey('left', true);
+    if (k === 'arrowright' || k === 'd') setKey('right', true);
+    if (k === 'p') togglePause();
+    if (k === 'enter' || k === ' ') {
+      if (state === 'menu' || state === 'gameover') startGame();
+      else if (state === 'paused') togglePause();
+    }
+  });
+
+  window.addEventListener('keyup', (e) => {
+    const k = e.key.toLowerCase();
+    if (k === 'arrowleft' || k === 'a') setKey('left', false);
+    if (k === 'arrowright' || k === 'd') setKey('right', false);
+  });
+
+  // Touch / mouse buttons
+  function holdButton(btn, side){
+    const down = (e) => { e.preventDefault(); setKey(side, true); };
+    const up   = (e) => { e.preventDefault(); setKey(side, false); };
+    btn.addEventListener('pointerdown', down);
+    btn.addEventListener('pointerup', up);
+    btn.addEventListener('pointercancel', up);
+    btn.addEventListener('pointerleave', up);
+  }
+  holdButton(btnLeft, 'left');
+  holdButton(btnRight, 'right');
+
+  btnPause.addEventListener('click', () => {
+    if (state === 'menu' || state === 'gameover') startGame();
+    else togglePause();
+  });
+
+  // Also allow dragging on the canvas (mobile friendly)
+  let dragging = false;
+  canvas.addEventListener('pointerdown', (e) => {
+    dragging = true;
+    canvas.setPointerCapture(e.pointerId);
+    if (state === 'menu' || state === 'gameover') startGame();
+    movePlayerToPointer(e);
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    movePlayerToPointer(e);
+  });
+  canvas.addEventListener('pointerup', () => dragging = false);
+  canvas.addEventListener('pointercancel', () => dragging = false);
+
+  function movePlayerToPointer(e){
+    const rect = canvas.getBoundingClientRect();
+    const nx = (e.clientX - rect.left) / rect.width * canvas.width;
+    player.x = clamp(nx - player.w/2, 10, canvas.width - player.w - 10);
+  }
+
+  // ---------- Game control ----------
+  function reset() {
+    score = 0;
+    lives = 3;
+    elapsed = 0;
+    spawnAcc = 0;
+    drops.length = 0;
+    player.x = canvas.width / 2 - player.w/2;
+    shake = 0;
+  }
+
+  function startGame() {
+    reset();
+    state = 'playing';
+    btnPause.textContent = 'Pause';
+    beep(660, 0.05, 0.06);
+  }
+
+  function togglePause() {
+    if (state === 'playing') {
+      state = 'paused';
+      btnPause.textContent = 'Resume';
+      beep(300, 0.05, 0.04);
+    } else if (state === 'paused') {
+      state = 'playing';
+      btnPause.textContent = 'Pause';
+      beep(520, 0.05, 0.04);
+    }
+  }
+
+  function gameOver() {
+    state = 'gameover';
+    btnPause.textContent = 'Play';
+    beep(180, 0.10, 0.06);
+    beep(140, 0.12, 0.06);
+
+    if (score > highScore) {
+      highScore = score;
+      localStorage.setItem(STORAGE_KEY, String(highScore));
+    }
+  }
+
+  // ---------- Spawning ----------
+  function spawnDrop() {
+    // Difficulty ramps over time: faster + more bombs.
+    const t = elapsed;
+
+    // Spawn types:
+    // coin: common early
+    // bomb: increases with time
+    const bombChance = clamp(0.12 + t * 0.01, 0.12, 0.55);
+    const type = (Math.random() < bombChance) ? 'bomb' : 'coin';
+
+    const r = (type === 'coin') ? rand(10, 14) : rand(12, 16);
+    const x = rand(20 + r, canvas.width - 20 - r);
+    const y = -30 - r;
+
+    const baseSpeed = 120 + t * 8;               // grows
+    const vy = baseSpeed + rand(0, 90);          // variation
+
+    drops.push({ x, y, r, vy, type, spin: rand(0, Math.PI*2) });
+  }
+
+  // ---------- Update & Draw ----------
+  function update(dt) {
+    if (state !== 'playing') return;
+
+    elapsed += dt;
+
+    // Player movement (keyboard)
+    const dir = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+    player.x = clamp(player.x + dir * player.speed * dt, 10, canvas.width - player.w - 10);
+
+    // Stars
+    for (const s of stars) {
+      s.y += s.s * dt;
+      if (s.y > canvas.height + 4) { s.y = -4; s.x = Math.random() * canvas.width; }
+    }
+
+    // Spawn timing (interval decreases over time)
+    const interval = clamp(0.75 - elapsed * 0.01, 0.22, 0.75);
+    spawnAcc += dt;
+    while (spawnAcc >= interval) {
+      spawnAcc -= interval;
+      spawnDrop();
+    }
+
+    // Drops update
+    for (let i = drops.length - 1; i >= 0; i--) {
+      const d = drops[i];
+      d.y += d.vy * dt;
+      d.spin += dt * 4;
+
+      if (rectCircleCollide(player.x, player.y, player.w, player.h, d.x, d.y, d.r)) {
+        if (d.type === 'coin') {
+          score += 10;
+          beep(820, 0.04, 0.05);
+        } else {
+          lives -= 1;
+          shake = 10;
+          beep(110, 0.08, 0.07);
+          if (lives <= 0) {
+            drops.splice(i, 1);
+            gameOver();
+            return;
+          }
+        }
+        drops.splice(i, 1);
+        continue;
+      }
+
+      if (d.y > canvas.height + 40) drops.splice(i, 1);
+    }
+
+    shake = Math.max(0, shake - 30 * dt);
+  }
+
+  function draw() {
+    // Screen shake
+    const sx = (shake > 0) ? rand(-shake, shake) : 0;
+    const sy = (shake > 0) ? rand(-shake, shake) : 0;
+
+    ctx.save();
+    ctx.translate(sx, sy);
+
+    // Background
+    ctx.fillStyle = '#05060a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Stars
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    for (const s of stars) {
+      ctx.globalAlpha = 0.25 + (s.r / 2.0) * 0.35;
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Ground glow
+    const g = ctx.createLinearGradient(0, canvas.height - 160, 0, canvas.height);
+    g.addColorStop(0, 'rgba(0, 190, 255, 0.00)');
+    g.addColorStop(1, 'rgba(0, 190, 255, 0.10)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, canvas.height - 160, canvas.width, 160);
+
+    // Player (rounded-ish)
+    ctx.fillStyle = 'rgba(0, 210, 255, 0.95)';
+    roundRect(ctx, player.x, player.y, player.w, player.h, 7);
+    ctx.fill();
+
+    // Drops
+    for (const d of drops) {
+      if (d.type === 'coin') drawCoin(d);
+      else drawBomb(d);
+    }
+
+    // UI text
+    uiLeft.textContent  = `Score: ${score} • Lives: ${lives}`;
+    uiRight.textContent = `High: ${highScore}`;
+
+    // Overlays
+    if (state === 'menu') overlay(
+      'Catch & Dodge',
+      'Catch coins (+10), avoid bombs.\nPress Enter/Space or tap to start.'
+    );
+
+    if (state === 'paused') overlay(
+      'Paused',
+      'Press P or Resume to continue.'
+    );
+
+    if (state === 'gameover') overlay(
+      'Game Over',
+      `Final score: ${score}\nPress Enter/Space or tap to play again.`
+    );
+
+    ctx.restore();
+  }
+
+  function overlay(title, subtitle) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.95)';
+    ctx.textAlign = 'center';
+
+    ctx.font = '700 36px system-ui, sans-serif';
+    ctx.fillText(title, canvas.width / 2, canvas.height * 0.42);
+
+    ctx.font = '500 15px system-ui, sans-serif';
+    const lines = subtitle.split('\n');
+    let y = canvas.height * 0.42 + 38;
+    ctx.fillStyle = 'rgba(255,255,255,0.82)';
+    for (const line of lines) {
+      ctx.fillText(line, canvas.width / 2, y);
+      y += 20;
+    }
+
+    ctx.font = '600 12px system-ui, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.65)';
+    ctx.fillText('Offline game • No internet needed', canvas.width / 2, canvas.height * 0.92);
+    ctx.restore();
+  }
+
+  function roundRect(c, x, y, w, h, r) {
+    const rr = Math.min(r, w/2, h/2);
+    c.beginPath();
+    c.moveTo(x + rr, y);
+    c.arcTo(x + w, y, x + w, y + h, rr);
+    c.arcTo(x + w, y + h, x, y + h, rr);
+    c.arcTo(x, y + h, x, y, rr);
+    c.arcTo(x, y, x + w, y, rr);
+    c.closePath();
+  }
+
+  function drawCoin(d) {
+    const grad = ctx.createRadialGradient(d.x - d.r*0.3, d.y - d.r*0.3, 2, d.x, d.y, d.r);
+    grad.addColorStop(0, 'rgba(255, 245, 190, 0.98)');
+    grad.addColorStop(1, 'rgba(255, 185, 0, 0.98)');
+    ctx.fillStyle = grad;
+
+    ctx.beginPath();
+    ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
+    ctx.fill();
+
+    // coin shine line
+    ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    const a = d.spin;
+    ctx.arc(d.x, d.y, d.r * 0.7, a, a + Math.PI * 0.9);
+    ctx.stroke();
+  }
+
+  function drawBomb(d) {
+    const grad = ctx.createRadialGradient(d.x - d.r*0.2, d.y - d.r*0.2, 2, d.x, d.y, d.r);
+    grad.addColorStop(0, 'rgba(255, 165, 165, 0.95)');
+    grad.addColorStop(1, 'rgba(220, 40, 40, 0.98)');
+    ctx.fillStyle = grad;
+
+    ctx.beginPath();
+    ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
+    ctx.fill();
+
+    // fuse
+    ctx.strokeStyle = 'rgba(255, 220, 170, 0.9)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(d.x + d.r*0.2, d.y - d.r*0.7);
+    ctx.quadraticCurveTo(d.x + d.r*1.1, d.y - d.r*1.2, d.x + d.r*0.9, d.y - d.r*2.0);
+    ctx.stroke();
+
+    // little spark
+    ctx.fillStyle = 'rgba(255, 240, 120, 0.95)';
+    ctx.beginPath();
+    ctx.arc(d.x + d.r*0.9, d.y - d.r*2.0, 2.2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // ---------- Main loop ----------
+  function loop(t) {
+    const dt = clamp((t - lastT) / 1000, 0, 1/20);
+    lastT = t;
+
+    update(dt);
+    draw();
+
+    requestAnimationFrame(loop);
+  }
+
+  // Initial UI and start loop
+  uiRight.textContent = `High: ${highScore}`;
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
