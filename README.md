@@ -26,3 +26,4 @@ Since this project is built with pure HTML/JS, you don't need a build process.
 
 ## 📝 License
 This project is licensed under the MIT License.
+https://darkraider888.github.io/Catch-Dodge/
